@@ -10,23 +10,68 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-ARG DEBIAN_ARCH=amd64
-# We not using scratch because we need to keep the basic image information
-# from parent image
-FROM registry.k8s.io/build-image/debian-base-${DEBIAN_ARCH}:bullseye-v1.4.3
+################################################################################
+##                               BUILD ARGS                                   ##
+################################################################################
+# This build arg allows the specification of a custom Golang image.
+ARG GOLANG_IMAGE=golang:1.19.6
 
-ARG ARCH=amd64
+# We use Alpine as the source for default CA certificates
+ARG ALPINE_IMAGE=alpine:3.15.4
+
+# We use Debian as the base of the target image
+ARG DEBIAN_IMAGE=registry.k8s.io/build-image/debian-base:bullseye-v1.4.3
+
+ARG COMPONENT=cinder-csi-plugin
+
+################################################################################
+##                              BUILD STAGE                                   ##
+################################################################################
+# Fetch ca-certificates from Alpine
+FROM ${ALPINE_IMAGE} as certs
+RUN apk add --no-cache ca-certificates
+
+# Build the manager as a statically compiled binary so it has no dependencies
+# libc, muscl, etc.
+FROM --platform=linux/amd64 ${GOLANG_IMAGE} as builder
+
+ARG GOPROXY=https://goproxy.io,direct
+ARG TARGETOS
+ARG TARGETARCH
+ARG VERSION
+ARG COMPONENT
+
+WORKDIR /build
+COPY go.mod go.sum ./
+COPY cmd/ cmd/
+COPY pkg/ pkg/
+RUN GO111MODULE=on CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} GOPROXY=${GOPROXY} \
+                go build \
+                -trimpath \
+                -ldflags="-w -s -X k8s.io/component-base/version.gitVersion=${VERSION}" \
+                -o=$COMPONENT \
+                cmd/$COMPONENT/main.go
+
+################################################################################
+##                               MAIN STAGE                                   ##
+################################################################################
+FROM --platform=${TARGETPLATFORM} ${DEBIAN_IMAGE}
+
+ARG COMPONENT
+
+# Install e4fsprogs for format
+RUN clean-install btrfs-progs e2fsprogs mount udev xfsprogs
+
+COPY --from=builder /build/$COMPONENT /bin/$COMPONENT
+COPY --from=certs /etc/ssl/certs /etc/ssl/certs
 
 # Fill out the labels
 LABEL name="cinder-csi-plugin" \
       license="Apache Version 2.0" \
       maintainers="Kubernetes Authors" \
       description="Cinder CSI Plugin" \
-      architecture=$ARCH \
       distribution-scope="public" \
       summary="Cinder CSI Plugin" \
       help="none"
-
-ADD rootfs.tar /
 
 CMD ["/bin/cinder-csi-plugin"]

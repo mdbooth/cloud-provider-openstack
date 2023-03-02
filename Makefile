@@ -33,10 +33,6 @@ TAR_FILE	?= rootfs.tar
 GOOS		?= $(shell go env GOOS)
 GIT_VERSION     := $(shell git describe --dirty --tags --match='v*')
 VERSION         ?= $(GIT_VERSION)
-ALPINE_ARCH	:=
-DEBIAN_ARCH	:=
-QEMUARCH	:=
-QEMUVERSION	:= "v4.2.0-4"
 GOARCH		:=
 GOFLAGS		:=
 TAGS		:=
@@ -73,23 +69,6 @@ $(GOBIN):
 
 work: $(GOBIN)
 
-ifeq ($(ARCH),arm)
-    DEBIAN_ARCH=$(ARCH)
-    GOARCH=$(ARCH)
-    QEMUARCH=$(ARCH)
-    ALPINE_ARCH=arm32v7
-else ifeq ($(ARCH),arm64)
-    DEBIAN_ARCH=$(ARCH)
-    GOARCH=$(ARCH)
-    QEMUARCH=aarch64
-    ALPINE_ARCH=arm64v8
-else
-    DEBIAN_ARCH=$(ARCH)
-    GOARCH=$(ARCH)
-    QEMUARCH=$(ARCH)
-    ALPINE_ARCH=$(ARCH)
-endif
-
 build-all-archs:
 	@for arch in $(ARCHS); do $(MAKE) ARCH=$${arch} build ; done
 
@@ -122,19 +101,6 @@ openstack-cloud-controller-manager: work $(SOURCES)
 		-ldflags $(LDFLAGS) \
 		-o openstack-cloud-controller-manager-$(ARCH) \
 		cmd/openstack-cloud-controller-manager/main.go
-
-# Remove individual image builder once we migrate openlab-zuul-jobs
-# to use new image-openstack-cloud-controller-manager target.
-image-controller-manager: work openstack-cloud-controller-manager
-ifeq ($(GOOS),linux)
-	cp -r cluster/images/openstack-cloud-controller-manager $(TEMP_DIR)
-	cp openstack-cloud-controller-manager-$(ARCH) $(TEMP_DIR)/openstack-cloud-controller-manager
-	cp $(TEMP_DIR)/openstack-cloud-controller-manager/Dockerfile.build $(TEMP_DIR)/openstack-cloud-controller-manager/Dockerfile
-	$(CONTAINER_ENGINE) build -t $(REGISTRY)/openstack-cloud-controller-manager:$(VERSION) $(TEMP_DIR)/openstack-cloud-controller-manager
-	rm -rf $(TEMP_DIR)/openstack-cloud-controller-manager
-else
-	$(error Please set GOOS=linux for building the image)
-endif
 
 build-cmd-%: work $(SOURCES)
 	@# Keep binary with no arch mark. We should remove this once we correct
@@ -226,65 +192,29 @@ realclean: clean
 shell:
 	$(SHELL) -i
 
-push-manifest-%:
-	$(CONTAINER_ENGINE) manifest create --amend $(REGISTRY)/$*:$(VERSION) $(shell echo $(ARCHS) | sed -e "s~[^ ]*~$(REGISTRY)/$*\-&:$(VERSION)~g")
-	@for arch in $(ARCHS); do $(CONTAINER_ENGINE) manifest annotate --os $(IMAGE_OS) --arch $${arch} $(REGISTRY)/$*:${VERSION} $(REGISTRY)/$*-$${arch}:${VERSION}; done
-	$(CONTAINER_ENGINE) manifest push --purge $(REGISTRY)/$*:${VERSION}
+# Build a single image for the local default platform and push to the local
+# docker
+build-local-image-%:
+	docker buildx build --output type=docker \
+		--build-arg VERSION=$(VERSION) \
+		--tag $(REGISTRY)/$*:$(VERSION) \
+		-f cluster/images/$*/Dockerfile \
+		.
 
-push-all-manifest: $(addprefix push-manifest-,$(IMAGE_NAMES))
+# Build all images locally
+build-local-images: $(addprefix build-image-,$(IMAGE_NAMES))
 
-build-images: $(addprefix image-,$(IMAGE_NAMES))
+# Build a single image for all architectures in ARCHS and push it to REGISTRY
+push-multiarch-image-%:
+	docker buildx build --output type=registry \
+		--build-arg VERSION=$(VERSION) \
+		--tag $(REGISTRY)/$*:$(VERSION) \
+		--platform $(shell echo $(addprefix linux/,$(ARCHS)) | sed 's/ /,/g') \
+		-f cluster/images/$*/Dockerfile \
+		.
 
-push-images: $(addprefix push-image-,$(IMAGE_NAMES))
-
-image-%: work
-	$(MAKE) $(addprefix build-cmd-,$*)
-ifeq ($(GOOS),linux)
-	cp -r cluster/images/$* $(TEMP_DIR)
-
-ifneq ($(ARCH),amd64)
-	$(CONTAINER_ENGINE) run --rm --privileged multiarch/qemu-user-static --reset -p yes
-	curl -sSL https://github.com/multiarch/qemu-user-static/releases/download/$(QEMUVERSION)/x86_64_qemu-$(QEMUARCH)-static.tar.gz | tar -xz -C $(TEMP_DIR)/$*
-	@# Ensure we don't get surprised by umask settings
-	chmod 0755 $(TEMP_DIR)/$*/qemu-$(QEMUARCH)-static
-	sed "/^FROM .*/a COPY qemu-$(QEMUARCH)-static /usr/bin/" $(TEMP_DIR)/$*/Dockerfile.build > $(TEMP_DIR)/$*/Dockerfile.build.tmp
-	mv $(TEMP_DIR)/$*/Dockerfile.build.tmp $(TEMP_DIR)/$*/Dockerfile.build
-endif
-
-	cp $*-$(ARCH) $(TEMP_DIR)/$*
-	$(CONTAINER_ENGINE) build --build-arg ALPINE_ARCH=$(ALPINE_ARCH) --build-arg ARCH=$(ARCH) --build-arg DEBIAN_ARCH=$(DEBIAN_ARCH) --pull -t build-$*-$(ARCH) -f $(TEMP_DIR)/$*/Dockerfile.build $(TEMP_DIR)/$*
-	$(CONTAINER_ENGINE) create --name build-$*-$(ARCH) build-$*-$(ARCH)
-	$(CONTAINER_ENGINE) export build-$*-$(ARCH) > $(TEMP_DIR)/$*/$(TAR_FILE)
-
-	@echo "build image $(REGISTRY)/$*-$(ARCH)"
-	$(CONTAINER_ENGINE) build --build-arg ALPINE_ARCH=$(ALPINE_ARCH) --build-arg ARCH=$(ARCH) --build-arg DEBIAN_ARCH=$(DEBIAN_ARCH) --pull -t $(REGISTRY)/$*-$(ARCH):$(VERSION) $(TEMP_DIR)/$*
-
-	rm -rf $(TEMP_DIR)/$*
-	$(CONTAINER_ENGINE) rm build-$*-$(ARCH)
-	$(CONTAINER_ENGINE) rmi build-$*-$(ARCH)
-else
-	$(error Please set GOOS=linux for building the image)
-endif
-
-push-image-%:
-	@echo "push image $*-$(ARCH) to $(REGISTRY)"
-ifneq ($(and $(DOCKER_USERNAME),$(DOCKER_PASSWORD)),)
-	@$(CONTAINER_ENGINE) login -u="$(DOCKER_USERNAME)" -p="$(DOCKER_PASSWORD)"
-endif
-	$(CONTAINER_ENGINE) push $(REGISTRY)/$*-$(ARCH):$(VERSION)
-
-images: $(addprefix build-arch-image-,$(ARCH))
-
-images-all-archs: $(addprefix build-arch-image-,$(ARCHS))
-
-build-arch-image-%:
-	@echo "Building images for ARCH=$*"
-	$(MAKE) ARCH=$* build-images
-
-upload-image-%:
-	$(MAKE) ARCH=$* build-images push-images
-
-upload-images: $(addprefix upload-image-,$(ARCHS)) push-all-manifest
+# Push all multiarch images
+push-multiarch-images: $(addprefix push-multiarch-image-,$(IMAGE_NAMES))
 
 version:
 	@echo ${VERSION}
