@@ -35,4 +35,4 @@ jobs:
 
     - name: build & publish images
       run: |
-        make push-multiarch-images REGISTRY=quay.io/mdbooth VERSION=${{ steps.get_version.outputs.VERSION }}
+        make push-multiarch-images REGISTRY=quay.io/mbooth VERSION=${{ steps.get_version.outputs.VERSION }}
